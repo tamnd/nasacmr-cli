@@ -1,10 +1,11 @@
 # nasacmr
 
-A command line for nasacmr.
+A command line for the NASA Common Metadata Repository (CMR).
 
-`nasacmr` is a single pure-Go binary. It reads public nasacmr data
-over plain HTTPS, shapes it into clean records, and prints output that pipes
-into the rest of your tools. No API key, nothing to run alongside it.
+`nasacmr` is a single pure-Go binary. It searches and lists Earth science data
+indexed by NASA — over 54,000 collections and millions of granules — over plain
+HTTPS, shapes it into clean records, and prints output that pipes into the rest
+of your tools. No API key required.
 
 The same package is also a [resource-URI driver](#use-it-as-a-resource-uri-driver),
 so a host program like [ant](https://github.com/tamnd/ant) can address
@@ -26,22 +27,19 @@ docker run --rm ghcr.io/tamnd/nasacmr:latest --help
 ## Usage
 
 ```bash
-nasacmr page <path>                      # fetch one page as a record
-nasacmr page <path> -o json              # as JSON, ready for jq
-nasacmr page <path> --template '{{.Body}}'  # just the readable body text
-nasacmr links <path>                     # the pages it links to, one per line
-nasacmr --help                           # the whole command tree
+nasacmr collections --keyword=landsat              # search collections
+nasacmr collections --provider=LAADS               # by data provider
+nasacmr collections --keyword=climate -o json      # as JSON, ready for jq
+nasacmr granules --short-name=HLSL30               # list granules
+nasacmr granules --short-name=HLSL30 --temporal=2024-01-01T00:00:00Z,2024-01-31T23:59:59Z
+nasacmr search --keyword=climate                   # full-text search
+nasacmr --help                                     # the whole command tree
 ```
 
 Every command shares one output contract: `-o table|json|jsonl|csv|tsv|url|raw`,
 `--fields` to pick columns, `--template` for a custom line, and `-n` to limit.
 The default adapts to where output goes (a table on a terminal, JSONL in a
 pipe), so the same command reads well by hand and parses cleanly downstream.
-
-This is a fresh scaffold. It ships one example resource type, `page`, wired end
-to end. Model the real nasacmr records in `nasacmr/` and declare their
-operations in `nasacmr/domain.go`; each one becomes a command, an HTTP
-route, and an MCP tool at once.
 
 ## Serve it
 
@@ -66,10 +64,9 @@ Then [ant](https://github.com/tamnd/ant) (or any program that links the package)
 dereferences `nasacmr://` URIs without knowing anything about nasacmr:
 
 ```bash
-ant get nasacmr://page/<path>   # fetch the record
-ant cat nasacmr://page/<path>   # just the body text
-ant ls  nasacmr://page/<path>   # the pages it links to, each addressable
-ant url nasacmr://page/<path>   # the live https URL
+ant get nasacmr://collection/C2021957657-LPCLOUD   # fetch a collection record
+ant cat nasacmr://collection/C2021957657-LPCLOUD   # just the abstract
+ant url nasacmr://collection/C2021957657-LPCLOUD   # the live CMR URL
 ```
 
 ## Development
