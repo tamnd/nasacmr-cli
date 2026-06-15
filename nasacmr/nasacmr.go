@@ -1,18 +1,18 @@
 // Package nasacmr is the library behind the nasacmr command line:
-// the HTTP client, request shaping, and the typed data models for the
-// NASA Common Metadata Repository (CMR) API.
+// the HTTP client, request shaping, and the typed data models for NASA's
+// Common Metadata Repository (CMR), which indexes Earth science data
+// collections and granules.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public API throws under load.
-// No API key is required.
+// Build your endpoint calls and JSON decoding on top of it.
 package nasacmr
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -20,363 +20,305 @@ import (
 	"time"
 )
 
-// Host is the CMR hostname this driver claims for URI routing.
+// DefaultUserAgent identifies the client to CMR.
+const DefaultUserAgent = "nasacmr-cli/0.1.0"
+
+// Host is the CMR hostname this client talks to, and the host the
+// URI driver in domain.go claims.
 const Host = "cmr.earthdata.nasa.gov"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the CMR search endpoint every request is built from.
+const BaseURL = "https://cmr.earthdata.nasa.gov/search"
 
-// Config holds all tunable parameters for the CMR client.
+// Config holds the runtime settings for the CMR client.
 type Config struct {
 	BaseURL   string
-	UserAgent string
 	Rate      time.Duration
-	Timeout   time.Duration
 	Retries   int
+	Timeout   time.Duration
+	UserAgent string
 }
 
-// DefaultConfig returns sensible defaults for the CMR client.
+// DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
 		BaseURL:   BaseURL,
-		UserAgent: "nasacmr-cli/0.1 (tamnd87@gmail.com)",
 		Rate:      500 * time.Millisecond,
-		Timeout:   30 * time.Second,
 		Retries:   3,
+		Timeout:   30 * time.Second,
+		UserAgent: DefaultUserAgent,
 	}
 }
 
-// Client talks to the NASA CMR API over HTTP.
+// Client talks to CMR over HTTPS.
 type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	BaseURL   string
-
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with DefaultConfig settings.
-func NewClient() *Client {
-	cfg := DefaultConfig()
+// NewClient returns a Client using the given Config.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: cfg.Timeout},
-		UserAgent: cfg.UserAgent,
-		BaseURL:   cfg.BaseURL,
-		Rate:      cfg.Rate,
-		Retries:   cfg.Retries,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// SearchCollections searches CMR collections by keyword, provider, platform, etc.
-// Returns collections and the total hit count from the CMR-Hits header.
-func (c *Client) SearchCollections(ctx context.Context, params CollectionParams) ([]*Collection, int, error) {
-	u := c.buildURL("/search/collections.json", params.toQuery()...)
-	body, headers, err := c.getWithHeaders(ctx, u)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	var raw wireCollectionsResp
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, 0, fmt.Errorf("collections decode: %w", err)
-	}
-
-	total, _ := strconv.Atoi(headers.Get("CMR-Hits"))
-
-	out := make([]*Collection, 0, len(raw.Feed.Entry))
-	for _, e := range raw.Feed.Entry {
-		out = append(out, &Collection{
-			ID:              e.ID,
-			ShortName:       e.ShortName,
-			Title:           e.Title,
-			Abstract:        e.Abstract,
-			Provider:        e.ArchiveCenter,
-			ProcessingLevel: e.ProcessingLevel,
-			Platforms:       e.Platforms,
-			ScienceKeywords: e.ScienceKeywords,
-			StartTime:       e.TimeStart,
-			EndTime:         e.TimeEnd,
-		})
-	}
-	return out, total, nil
-}
-
-// ListGranules lists granules for a collection by short name, concept ID, temporal range, etc.
-// Returns granules and the total hit count from the CMR-Hits header.
-func (c *Client) ListGranules(ctx context.Context, params GranuleParams) ([]*Granule, int, error) {
-	u := c.buildURL("/search/granules.json", params.toQuery()...)
-	body, headers, err := c.getWithHeaders(ctx, u)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	var raw wireGranulesResp
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, 0, fmt.Errorf("granules decode: %w", err)
-	}
-
-	total, _ := strconv.Atoi(headers.Get("CMR-Hits"))
-
-	out := make([]*Granule, 0, len(raw.Feed.Entry))
-	for _, e := range raw.Feed.Entry {
-		var accessURLs []string
-		for _, l := range e.Links {
-			if strings.Contains(l.Rel, "data") || strings.Contains(l.Type, "data") ||
-				l.Rel == "http://esipfed.org/ns/fedsearch/1.1/data#" {
-				accessURLs = append(accessURLs, l.Href)
-			}
-		}
-		out = append(out, &Granule{
-			ID:               e.ID,
-			Title:            e.Title,
-			GranuleUR:        e.GranuleUR,
-			Provider:         e.DataCenter,
-			Size:             e.GranuleSizeMB,
-			OnlineAccessURLs: accessURLs,
-			StartTime:        e.TimeStart,
-			EndTime:          e.TimeEnd,
-		})
-	}
-	return out, total, nil
-}
-
-// buildURL assembles a full request URL with optional key=value pairs.
-// Pairs with empty values are skipped.
-func (c *Client) buildURL(path string, params ...string) string {
-	base := c.BaseURL
-	if base == "" {
-		base = BaseURL
-	}
-	sb := strings.Builder{}
-	sb.WriteString(base)
-	sb.WriteString(path)
-	sep := "?"
-	for i := 0; i+1 < len(params); i += 2 {
-		if params[i+1] != "" {
-			sb.WriteString(sep)
-			sb.WriteString(url.QueryEscape(params[i]))
-			sb.WriteString("=")
-			sb.WriteString(url.QueryEscape(params[i+1]))
-			sep = "&"
-		}
-	}
-	return sb.String()
-}
-
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings.
-func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
-	body, _, err := c.getWithHeaders(ctx, rawURL)
-	return body, err
-}
-
-// getWithHeaders fetches url and returns the response body and headers.
-func (c *Client) getWithHeaders(ctx context.Context, rawURL string) ([]byte, http.Header, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
-			}
-		}
-		body, headers, retry, err := c.do(ctx, rawURL)
-		if err == nil {
-			return body, headers, nil
-		}
-		lastErr = err
-		if !retry {
-			return nil, nil, err
-		}
-	}
-	return nil, nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
-}
-
-func (c *Client) do(ctx context.Context, rawURL string) (body []byte, headers http.Header, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, true, err
-	}
-	return b, resp.Header, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
+	if c.cfg.Rate > 0 {
+		if since := time.Since(c.last); since < c.cfg.Rate {
+			time.Sleep(c.cfg.Rate - since)
+		}
 	}
 	c.last = time.Now()
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
-	}
-	return d
+// searchResult carries the parsed results from a CMR search response.
+// Hits comes from the CMR-Hits response header, not the JSON body.
+type searchResult struct {
+	Hits    int
+	Entries []json.RawMessage
 }
 
-// --- Public data types ---
+// get issues a GET request to rawURL, reads the CMR-Hits header, and decodes
+// the JSON body feed entries into a searchResult.
+func (c *Client) get(ctx context.Context, rawURL string) (*searchResult, error) {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		if attempt > 0 {
+			d := time.Duration(attempt) * 500 * time.Millisecond
+			if d > 5*time.Second {
+				d = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(d):
+			}
+		}
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if attempt < c.cfg.Retries {
+				continue
+			}
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
 
-// Collection is a NASA CMR data collection record.
-type Collection struct {
-	ID              string   `json:"id"                        kit:"id"`
-	ShortName       string   `json:"short_name,omitempty"`
-	Title           string   `json:"title,omitempty"`
-	Abstract        string   `json:"abstract,omitempty"        kit:"body"`
-	Provider        string   `json:"provider,omitempty"`
-	ProcessingLevel string   `json:"processing_level,omitempty"`
-	Platforms       []string `json:"platforms,omitempty"`
-	ScienceKeywords []string `json:"science_keywords,omitempty"`
-	StartTime       string   `json:"start_time,omitempty"`
-	EndTime         string   `json:"end_time,omitempty"`
+		// Read the total hit count from the CMR-Hits response header.
+		hits, _ := strconv.Atoi(resp.Header.Get("CMR-Hits"))
+
+		var body wireResp
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return nil, err
+		}
+		return &searchResult{Hits: hits, Entries: body.Feed.Entry}, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted")
 }
 
-// Granule is a NASA CMR granule (a single data file within a collection).
-type Granule struct {
-	ID               string   `json:"id"                         kit:"id"`
-	Title            string   `json:"title,omitempty"`
-	GranuleUR        string   `json:"granule_ur,omitempty"`
-	Provider         string   `json:"provider,omitempty"`
-	Size             float64  `json:"size_mb,omitempty"`
-	OnlineAccessURLs []string `json:"online_access_urls,omitempty"`
-	StartTime        string   `json:"start_time,omitempty"`
-	EndTime          string   `json:"end_time,omitempty"`
-}
-
-// CollectionParams holds search parameters for collection queries.
-type CollectionParams struct {
-	Keyword         string
-	Provider        string
-	Platform        string
-	ShortName       string
-	SpatialCoverage string
-	PageSize        int
-}
-
-func (p CollectionParams) toQuery() []string {
-	var q []string
-	if p.Keyword != "" {
-		q = append(q, "keyword", p.Keyword)
-	}
-	if p.Provider != "" {
-		q = append(q, "provider", p.Provider)
-	}
-	if p.Platform != "" {
-		q = append(q, "platform", p.Platform)
-	}
-	if p.ShortName != "" {
-		q = append(q, "short_name", p.ShortName)
-	}
-	if p.SpatialCoverage != "" {
-		q = append(q, "bounding_box", p.SpatialCoverage)
-	}
-	n := p.PageSize
-	if n <= 0 {
-		n = 10
-	}
-	q = append(q, "page_size", strconv.Itoa(n))
-	return q
-}
-
-// GranuleParams holds search parameters for granule queries.
-type GranuleParams struct {
-	ShortName string
-	ConceptID string
-	Temporal  string
-	Provider  string
-	PageSize  int
-}
-
-func (p GranuleParams) toQuery() []string {
-	var q []string
-	if p.ShortName != "" {
-		q = append(q, "short_name", p.ShortName)
-	}
-	if p.ConceptID != "" {
-		q = append(q, "concept_id", p.ConceptID)
-	}
-	if p.Temporal != "" {
-		q = append(q, "temporal", p.Temporal)
-	}
-	if p.Provider != "" {
-		q = append(q, "provider", p.Provider)
-	}
-	n := p.PageSize
-	if n <= 0 {
-		n = 10
-	}
-	q = append(q, "page_size", strconv.Itoa(n))
-	return q
-}
-
-// --- Wire types (internal, not exported) ---
-
-type wireCollectionsResp struct {
-	Feed struct {
-		Entry []wireCollection `json:"entry"`
-	} `json:"feed"`
-}
+// --- wire types (unexported) ---
 
 type wireCollection struct {
-	ID              string   `json:"id"`
-	ShortName       string   `json:"short_name"`
-	Title           string   `json:"title"`
-	Abstract        string   `json:"summary"` // note: "summary" in CMR JSON
-	Platforms       []string `json:"platforms"`
-	ArchiveCenter   string   `json:"archive_center"`
-	ProcessingLevel string   `json:"processing_level_id"`
-	ScienceKeywords []string `json:"science_keywords"`
-	TimeStart       string   `json:"time_start"`
-	TimeEnd         string   `json:"time_end"`
-}
-
-type wireGranulesResp struct {
-	Feed struct {
-		Entry []wireGranule `json:"entry"`
-	} `json:"feed"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	ShortName    string `json:"short_name"`
+	VersionID    string `json:"version_id"`
+	DataCenter   string `json:"data_center"`
+	Summary      string `json:"summary"`
+	TimeStart    string `json:"time_start"`
+	TimeEnd      string `json:"time_end"`
+	CloudHosted  bool   `json:"cloud_hosted"`
+	OnlineAccess bool   `json:"online_access_flag"`
 }
 
 type wireGranule struct {
-	ID            string  `json:"id"`
-	Title         string  `json:"title"`
-	GranuleUR     string  `json:"producer_granule_id"`
-	DataCenter    string  `json:"data_center"`
-	GranuleSizeMB float64 `json:"granule_size"`
-	TimeStart     string  `json:"time_start"`
-	TimeEnd       string  `json:"time_end"`
-	Links         []struct {
-		Href string `json:"href"`
-		Rel  string `json:"rel"`
-		Type string `json:"type"`
-	} `json:"links"`
+	ID           string  `json:"id"`
+	Title        string  `json:"title"`
+	TimeStart    string  `json:"time_start"`
+	TimeEnd      string  `json:"time_end"`
+	DataCenter   string  `json:"data_center"`
+	DayNightFlag string  `json:"day_night_flag"`
+	CloudCover   float64 `json:"cloud_cover"`
+	GranuleSize  float64 `json:"granule_size"`
+	OnlineAccess bool    `json:"online_access_flag"`
+}
+
+type wireFeed struct {
+	Entry []json.RawMessage `json:"entry"`
+}
+
+type wireResp struct {
+	Feed wireFeed `json:"feed"`
+}
+
+// --- public types ---
+
+// Collection is a single NASA CMR collection (dataset) record.
+type Collection struct {
+	ID          string `json:"id"           kit:"id"`
+	Title       string `json:"title"`
+	ShortName   string `json:"short_name"`
+	Version     string `json:"version"`
+	DataCenter  string `json:"data_center"`
+	Summary     string `json:"summary"`
+	TimeStart   string `json:"time_start"`
+	TimeEnd     string `json:"time_end"`
+	CloudHosted bool   `json:"cloud_hosted"`
+}
+
+// Granule is a single NASA CMR granule (file-level) record.
+type Granule struct {
+	ID         string  `json:"id"          kit:"id"`
+	Title      string  `json:"title"`
+	TimeStart  string  `json:"time_start"`
+	TimeEnd    string  `json:"time_end"`
+	DataCenter string  `json:"data_center"`
+	DayNight   string  `json:"day_night"`
+	CloudCover float64 `json:"cloud_cover"`
+	SizeMB     float64 `json:"size_mb"`
+	Online     bool    `json:"online"`
+}
+
+func toCollection(w wireCollection) Collection {
+	return Collection{
+		ID:          w.ID,
+		Title:       w.Title,
+		ShortName:   w.ShortName,
+		Version:     w.VersionID,
+		DataCenter:  w.DataCenter,
+		Summary:     w.Summary,
+		TimeStart:   w.TimeStart,
+		TimeEnd:     w.TimeEnd,
+		CloudHosted: w.CloudHosted,
+	}
+}
+
+func toGranule(w wireGranule) Granule {
+	return Granule{
+		ID:         w.ID,
+		Title:      w.Title,
+		TimeStart:  w.TimeStart,
+		TimeEnd:    w.TimeEnd,
+		DataCenter: w.DataCenter,
+		DayNight:   w.DayNightFlag,
+		CloudCover: w.CloudCover,
+		SizeMB:     w.GranuleSize,
+		Online:     w.OnlineAccess,
+	}
+}
+
+// SearchCollections searches CMR for collections matching keyword.
+// It returns the matching collections, the total hit count from CMR-Hits, and any error.
+func (c *Client) SearchCollections(ctx context.Context, keyword, provider string, limit, page int) ([]Collection, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if page <= 0 {
+		page = 1
+	}
+	params := url.Values{}
+	params.Set("page_size", strconv.Itoa(limit))
+	params.Set("page_num", strconv.Itoa(page))
+	if keyword != "" {
+		params.Set("keyword", keyword)
+	}
+	if provider != "" {
+		params.Set("provider", provider)
+	}
+	rawURL := c.cfg.BaseURL + "/collections.json?" + params.Encode()
+
+	res, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	out := make([]Collection, 0, len(res.Entries))
+	for _, raw := range res.Entries {
+		var w wireCollection
+		if err := json.Unmarshal(raw, &w); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, toCollection(w))
+	}
+	return out, res.Hits, nil
+}
+
+// GetCollection fetches a single CMR collection by its concept ID
+// (e.g. "C2826848343-LPCLOUD").
+func (c *Client) GetCollection(ctx context.Context, conceptID string) (*Collection, error) {
+	params := url.Values{}
+	params.Set("concept_id", conceptID)
+	params.Set("page_size", "1")
+	rawURL := c.cfg.BaseURL + "/collections.json?" + params.Encode()
+
+	res, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if len(res.Entries) == 0 {
+		return nil, fmt.Errorf("collection %q not found", conceptID)
+	}
+	var w wireCollection
+	if err := json.Unmarshal(res.Entries[0], &w); err != nil {
+		return nil, err
+	}
+	col := toCollection(w)
+	return &col, nil
+}
+
+// SearchGranules lists granules for the given short_name.
+// temporal is an optional "start,end" string (e.g. "2024-01-01,2024-02-01").
+// It returns the matching granules, the total hit count from CMR-Hits, and any error.
+func (c *Client) SearchGranules(ctx context.Context, shortName, version, temporal string, limit, page int) ([]Granule, int, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	if page <= 0 {
+		page = 1
+	}
+	params := url.Values{}
+	params.Set("page_size", strconv.Itoa(limit))
+	params.Set("page_num", strconv.Itoa(page))
+	params.Set("short_name", shortName)
+	if version != "" {
+		params.Set("version", version)
+	}
+	if temporal != "" {
+		parts := strings.SplitN(temporal, ",", 2)
+		if len(parts) == 2 {
+			params.Set("temporal[]", parts[0]+","+parts[1])
+		}
+	}
+	rawURL := c.cfg.BaseURL + "/granules.json?" + params.Encode()
+
+	res, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	out := make([]Granule, 0, len(res.Entries))
+	for _, raw := range res.Entries {
+		var w wireGranule
+		if err := json.Unmarshal(raw, &w); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, toGranule(w))
+	}
+	return out, res.Hits, nil
 }

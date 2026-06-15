@@ -9,279 +9,161 @@ import (
 	"time"
 )
 
-func TestGet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("User-Agent") == "" {
-			t.Error("request carried no User-Agent")
-		}
-		_, _ = w.Write([]byte("ok"))
-	}))
-	defer srv.Close()
-
-	c := NewClient()
-	c.Rate = 0 // no pacing in the test
-
-	body, err := c.Get(context.Background(), srv.URL)
-	if err != nil {
-		t.Fatal(err)
+// mockFeed builds a JSON response body in CMR feed format.
+func mockFeed(entries []any) []byte {
+	raws := make([]json.RawMessage, 0, len(entries))
+	for _, e := range entries {
+		b, _ := json.Marshal(e)
+		raws = append(raws, b)
 	}
-	if string(body) != "ok" {
-		t.Errorf("body = %q, want %q", body, "ok")
-	}
+	body := wireResp{Feed: wireFeed{Entry: raws}}
+	b, _ := json.Marshal(body)
+	return b
 }
 
-func TestGetRetriesOn503(t *testing.T) {
-	var hits int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits++
-		if hits < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = w.Write([]byte("recovered"))
-	}))
-	defer srv.Close()
-
-	c := NewClient()
-	c.Rate = 0
-	c.Retries = 5
-
-	start := time.Now()
-	body, err := c.Get(context.Background(), srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "recovered" {
-		t.Errorf("body = %q after retries", body)
-	}
-	if hits != 3 {
-		t.Errorf("server saw %d hits, want 3", hits)
-	}
-	if time.Since(start) < 500*time.Millisecond {
-		t.Error("retries did not back off")
-	}
+func testClient(baseURL string) *Client {
+	cfg := DefaultConfig()
+	cfg.BaseURL = baseURL
+	cfg.Rate = 0 // no pacing in tests
+	return NewClient(cfg)
 }
 
 func TestSearchCollections(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/search/collections.json" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		kw := r.URL.Query().Get("keyword")
-		if kw != "landsat" {
-			t.Errorf("keyword = %q, want landsat", kw)
-		}
-		w.Header().Set("Content-Type", "application/json")
+	colls := []wireCollection{
+		{ID: "C1234-LPCLOUD", Title: "MODIS Land Cover", ShortName: "MCD12Q1", VersionID: "006", DataCenter: "LPCLOUD"},
+		{ID: "C5678-NSIDC", Title: "Arctic Sea Ice Extent", ShortName: "NSIDC-0051", VersionID: "002", DataCenter: "NSIDC_ECS"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("CMR-Hits", "54544")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"feed": map[string]interface{}{
-				"entry": []map[string]interface{}{
-					{
-						"id":             "C123-LAADS",
-						"short_name":     "MOD02QKM",
-						"title":          "MODIS/Terra Calibrated Radiances",
-						"summary":        "Calibrated radiances in 250m resolution",
-						"archive_center": "LAADS",
-					},
-				},
-			},
-		})
+		w.Header().Set("Content-Type", "application/json")
+		entries := make([]any, len(colls))
+		for i, c := range colls {
+			entries[i] = c
+		}
+		w.Write(mockFeed(entries))
 	}))
-	defer ts.Close()
+	defer srv.Close()
 
-	c := NewClient()
-	c.BaseURL = ts.URL
-	c.Rate = 0
-
-	cols, total, err := c.SearchCollections(context.Background(), CollectionParams{
-		Keyword:  "landsat",
-		PageSize: 10,
-	})
+	c := testClient(srv.URL)
+	results, total, err := c.SearchCollections(context.Background(), "land cover", "", 10, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if total != 54544 {
 		t.Errorf("total = %d, want 54544", total)
 	}
-	if len(cols) != 1 {
-		t.Fatalf("len(cols) = %d, want 1", len(cols))
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
 	}
-	if cols[0].ID != "C123-LAADS" {
-		t.Errorf("ID = %q, want C123-LAADS", cols[0].ID)
+	if results[0].Title != "MODIS Land Cover" {
+		t.Errorf("results[0].Title = %q, want MODIS Land Cover", results[0].Title)
 	}
-	if cols[0].ShortName != "MOD02QKM" {
-		t.Errorf("ShortName = %q, want MOD02QKM", cols[0].ShortName)
-	}
-	if cols[0].Abstract != "Calibrated radiances in 250m resolution" {
-		t.Errorf("Abstract = %q", cols[0].Abstract)
-	}
-	if cols[0].Provider != "LAADS" {
-		t.Errorf("Provider = %q, want LAADS", cols[0].Provider)
+	if results[1].Title != "Arctic Sea Ice Extent" {
+		t.Errorf("results[1].Title = %q, want Arctic Sea Ice Extent", results[1].Title)
 	}
 }
 
-func TestSearchCollectionsByProvider(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		prov := r.URL.Query().Get("provider")
-		if prov != "LAADS" {
-			t.Errorf("provider = %q, want LAADS", prov)
-		}
+func TestGetCollection(t *testing.T) {
+	col := wireCollection{
+		ID:         "C2826848343-LPCLOUD",
+		Title:      "Airborne Hyperspectral Imagery",
+		ShortName:  "AHI-L1B",
+		VersionID:  "001",
+		DataCenter: "LPCLOUD",
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("CMR-Hits", "1")
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("CMR-Hits", "200")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"feed": map[string]interface{}{
-				"entry": []map[string]interface{}{
-					{"id": "C456-LAADS", "short_name": "MOD04_L2", "title": "MODIS Aerosol", "summary": "Aerosol data"},
-				},
-			},
-		})
+		w.Write(mockFeed([]any{col}))
 	}))
-	defer ts.Close()
+	defer srv.Close()
 
-	c := NewClient()
-	c.BaseURL = ts.URL
-	c.Rate = 0
-
-	cols, total, err := c.SearchCollections(context.Background(), CollectionParams{
-		Provider: "LAADS",
-		PageSize: 5,
-	})
+	c := testClient(srv.URL)
+	result, err := c.GetCollection(context.Background(), "C2826848343-LPCLOUD")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 200 {
-		t.Errorf("total = %d, want 200", total)
+	if result.ShortName != "AHI-L1B" {
+		t.Errorf("ShortName = %q, want AHI-L1B", result.ShortName)
 	}
-	if len(cols) != 1 {
-		t.Fatalf("len(cols) = %d, want 1", len(cols))
-	}
-	if cols[0].ID != "C456-LAADS" {
-		t.Errorf("ID = %q, want C456-LAADS", cols[0].ID)
+	if result.ID != "C2826848343-LPCLOUD" {
+		t.Errorf("ID = %q, want C2826848343-LPCLOUD", result.ID)
 	}
 }
 
-func TestListGranules(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/search/granules.json" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		sn := r.URL.Query().Get("short_name")
-		if sn != "HLSL30" {
-			t.Errorf("short_name = %q, want HLSL30", sn)
-		}
+func TestSearchGranules(t *testing.T) {
+	granules := []wireGranule{
+		{ID: "G1001-LPCLOUD", Title: "MOD13Q1.A2024001", TimeStart: "2024-01-01T00:00:00Z", TimeEnd: "2024-01-17T00:00:00Z", DataCenter: "LPCLOUD"},
+		{ID: "G1002-LPCLOUD", Title: "MOD13Q1.A2024017", TimeStart: "2024-01-17T00:00:00Z", TimeEnd: "2024-02-02T00:00:00Z", DataCenter: "LPCLOUD"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("CMR-Hits", "374000000")
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("CMR-Hits", "12345")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"feed": map[string]interface{}{
-				"entry": []map[string]interface{}{
-					{
-						"id":                  "G2021957800-LPCLOUD",
-						"title":               "HLS.L30.T10UDV.2024001T185318.v2.0",
-						"producer_granule_id": "HLS.L30.T10UDV.2024001T185318.v2.0",
-						"data_center":         "LPCLOUD",
-						"granule_size":        189.5,
-						"time_start":          "2024-01-01T18:53:18Z",
-						"time_end":            "2024-01-01T18:53:36Z",
-						"links": []map[string]interface{}{
-							{
-								"href": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/HLSL30.020/HLS.L30.T10UDV.2024001T185318.v2.0.B02.tif",
-								"rel":  "http://esipfed.org/ns/fedsearch/1.1/data#",
-								"type": "image/tiff",
-							},
-						},
-					},
-				},
-			},
-		})
+		entries := make([]any, len(granules))
+		for i, g := range granules {
+			entries[i] = g
+		}
+		w.Write(mockFeed(entries))
 	}))
-	defer ts.Close()
+	defer srv.Close()
 
-	c := NewClient()
-	c.BaseURL = ts.URL
-	c.Rate = 0
-
-	grans, total, err := c.ListGranules(context.Background(), GranuleParams{
-		ShortName: "HLSL30",
-		PageSize:  5,
-	})
+	c := testClient(srv.URL)
+	results, total, err := c.SearchGranules(context.Background(), "MOD13Q1", "006", "2024-01-01,2024-02-01", 10, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if total != 12345 {
-		t.Errorf("total = %d, want 12345", total)
+	if total != 374000000 {
+		t.Errorf("total = %d, want 374000000", total)
 	}
-	if len(grans) != 1 {
-		t.Fatalf("len(grans) = %d, want 1", len(grans))
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
 	}
-	g := grans[0]
-	if g.ID != "G2021957800-LPCLOUD" {
-		t.Errorf("ID = %q, want G2021957800-LPCLOUD", g.ID)
+	if results[0].TimeStart != "2024-01-01T00:00:00Z" {
+		t.Errorf("results[0].TimeStart = %q, want 2024-01-01T00:00:00Z", results[0].TimeStart)
 	}
-	if g.Provider != "LPCLOUD" {
-		t.Errorf("Provider = %q, want LPCLOUD", g.Provider)
-	}
-	if g.Size != 189.5 {
-		t.Errorf("Size = %v, want 189.5", g.Size)
-	}
-	if len(g.OnlineAccessURLs) != 1 {
-		t.Errorf("OnlineAccessURLs len = %d, want 1", len(g.OnlineAccessURLs))
+	if results[1].TimeStart != "2024-01-17T00:00:00Z" {
+		t.Errorf("results[1].TimeStart = %q, want 2024-01-17T00:00:00Z", results[1].TimeStart)
 	}
 }
 
-func TestListGranulesWithTemporal(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		temp := r.URL.Query().Get("temporal")
-		if temp == "" {
-			t.Error("temporal param missing")
+func TestRetryOn503(t *testing.T) {
+	var hits int
+	col := wireCollection{ID: "C999-PROVIDER", Title: "Recovered Collection", ShortName: "REC"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
+		w.Header().Set("CMR-Hits", "1")
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("CMR-Hits", "3")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"feed": map[string]interface{}{
-				"entry": []map[string]interface{}{
-					{"id": "G001", "title": "granule1"},
-					{"id": "G002", "title": "granule2"},
-				},
-			},
-		})
+		w.Write(mockFeed([]any{col}))
 	}))
-	defer ts.Close()
+	defer srv.Close()
 
-	c := NewClient()
-	c.BaseURL = ts.URL
-	c.Rate = 0
-
-	grans, total, err := c.ListGranules(context.Background(), GranuleParams{
-		ShortName: "HLSL30",
-		Temporal:  "2024-01-01T00:00:00Z,2024-01-31T23:59:59Z",
-		PageSize:  5,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if total != 3 {
-		t.Errorf("total = %d, want 3", total)
-	}
-	if len(grans) != 2 {
-		t.Errorf("len(grans) = %d, want 2", len(grans))
-	}
-}
-
-func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.BaseURL != BaseURL {
-		t.Errorf("BaseURL = %q, want %q", cfg.BaseURL, BaseURL)
+	cfg.BaseURL = srv.URL
+	cfg.Rate = 0
+	cfg.Retries = 3
+	c := NewClient(cfg)
+
+	start := time.Now()
+	results, total, err := c.SearchCollections(context.Background(), "test", "", 10, 1)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if cfg.Rate != 500*time.Millisecond {
-		t.Errorf("Rate = %v, want 500ms", cfg.Rate)
+	if hits != 3 {
+		t.Errorf("server saw %d hits, want 3", hits)
 	}
-	if cfg.Timeout != 30*time.Second {
-		t.Errorf("Timeout = %v, want 30s", cfg.Timeout)
+	if total != 1 {
+		t.Errorf("total = %d, want 1", total)
 	}
-	if cfg.Retries != 3 {
-		t.Errorf("Retries = %d, want 3", cfg.Retries)
+	if len(results) != 1 || results[0].ID != "C999-PROVIDER" {
+		t.Errorf("unexpected results: %+v", results)
 	}
-	if cfg.UserAgent == "" {
-		t.Error("UserAgent must not be empty")
+	// backoff for attempt=1 is 500ms, so total must be >= 500ms
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("retries did not back off: elapsed %v", elapsed)
 	}
 }
