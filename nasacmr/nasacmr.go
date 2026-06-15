@@ -310,11 +310,11 @@ func (p CollectionParams) toQuery() []string {
 
 // GranuleParams holds search parameters for granule queries.
 type GranuleParams struct {
-	ShortName  string
-	ConceptID  string
-	Temporal   string
-	Provider   string
-	PageSize   int
+	ShortName string
+	ConceptID string
+	Temporal  string
+	Provider  string
+	PageSize  int
 }
 
 func (p GranuleParams) toQuery() []string {
@@ -367,14 +367,14 @@ type wireGranulesResp struct {
 }
 
 type wireGranule struct {
-	ID         string  `json:"id"`
-	Title      string  `json:"title"`
-	GranuleUR  string  `json:"producer_granule_id"`
-	DataCenter string  `json:"data_center"`
+	ID            string  `json:"id"`
+	Title         string  `json:"title"`
+	GranuleUR     string  `json:"producer_granule_id"`
+	DataCenter    string  `json:"data_center"`
 	GranuleSizeMB float64 `json:"granule_size"`
-	TimeStart  string  `json:"time_start"`
-	TimeEnd    string  `json:"time_end"`
-	Links      []struct {
+	TimeStart     string  `json:"time_start"`
+	TimeEnd       string  `json:"time_end"`
+	Links         []struct {
 		Href string `json:"href"`
 		Rel  string `json:"rel"`
 		Type string `json:"type"`
