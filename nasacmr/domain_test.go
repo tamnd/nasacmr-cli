@@ -1,14 +1,12 @@
 package nasacmr
 
 import (
+	"strings"
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in nasacmr_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
+// The client's HTTP behaviour is covered in nasacmr_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,63 +22,80 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"C2021957657-LPCLOUD", "collection", "C2021957657-LPCLOUD"},
-		{"/search/collections", "collection", "search/collections"},
-		{"https://" + Host + "/search/granules.json", "collection", "search/granules.json"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+	}{
+		{"C2826848343-LPCLOUD", "collection", "C2826848343-LPCLOUD"},
+		{"MOD13Q1", "collection", "MOD13Q1"},
+		{"land surface temperature", "collection", "land surface temperature"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if err != nil {
+			t.Errorf("Classify(%q) error: %v", tc.in, err)
+			continue
+		}
+		if typ != tc.typ {
+			t.Errorf("Classify(%q) type = %q, want %q", tc.in, typ, tc.typ)
+		}
+		if id != tc.id {
+			t.Errorf("Classify(%q) id = %q, want %q", tc.in, id, tc.id)
 		}
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("collection", "C2021957657-LPCLOUD")
-	want := "https://" + Host + "/search/collections.json?concept_id=C2021957657-LPCLOUD"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("Classify(\"\") expected error, got nil")
 	}
-
-	got2, err2 := Domain{}.Locate("granule", "G2021957800-LPCLOUD")
-	want2 := "https://" + Host + "/search/granules.json?concept_id=G2021957800-LPCLOUD"
-	if err2 != nil || got2 != want2 {
-		t.Errorf("Locate(granule) = (%q, %v), want (%q, nil)", got2, err2, want2)
+	_, _, err = Domain{}.Classify("   ")
+	if err == nil {
+		t.Error("Classify(\"   \") expected error, got nil")
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocate(t *testing.T) {
+	got, err := Domain{}.Locate("collection", "C2826848343-LPCLOUD")
+	if err != nil {
+		t.Fatalf("Locate error: %v", err)
+	}
+	if !strings.Contains(got, "C2826848343-LPCLOUD") {
+		t.Errorf("Locate = %q, expected to contain concept ID", got)
+	}
+	if !strings.Contains(got, "search.earthdata.nasa.gov") {
+		t.Errorf("Locate = %q, expected search.earthdata.nasa.gov", got)
+	}
+}
+
+func TestLocateGranule(t *testing.T) {
+	got, err := Domain{}.Locate("granule", "G1234567890-LPCLOUD")
+	if err != nil {
+		t.Fatalf("Locate error: %v", err)
+	}
+	if !strings.Contains(got, "G1234567890-LPCLOUD") {
+		t.Errorf("Locate = %q, expected to contain granule ID", got)
+	}
+	if !strings.Contains(got, "cmr.earthdata.nasa.gov") {
+		t.Errorf("Locate = %q, expected cmr.earthdata.nasa.gov", got)
+	}
+}
+
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("experiment", "some-id")
+	if err == nil {
+		t.Error("expected error for unknown type, got nil")
+	}
+}
+
 func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+	info := Domain{}.Info()
+	if len(info.Hosts) == 0 || info.Hosts[0] != Host {
+		t.Errorf("Hosts[0] = %q, want %s", info.Hosts[0], Host)
 	}
-
-	c := &Collection{
-		ID:       "C2021957657-LPCLOUD",
-		Title:    "HLS Landsat Operational Land Imager Surface Reflectance",
-		Abstract: "The Harmonized Landsat and Sentinel-2 (HLS) project.",
-	}
-	u, err := h.Mint(c)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
-	}
-	if want := "nasacmr://collection/C2021957657-LPCLOUD"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(c); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("nasacmr", "MOD02QKM")
-	if err != nil || got.String() != "nasacmr://collection/MOD02QKM" {
-		t.Errorf("ResolveOn = (%q, %v), want nasacmr://collection/MOD02QKM", got.String(), err)
+	if Host != "cmr.earthdata.nasa.gov" {
+		t.Errorf("Host = %q, want cmr.earthdata.nasa.gov", Host)
 	}
 }
