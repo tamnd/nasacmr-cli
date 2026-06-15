@@ -77,10 +77,10 @@ func TestSearchCollections(t *testing.T) {
 			"feed": map[string]interface{}{
 				"entry": []map[string]interface{}{
 					{
-						"id":         "C123-LAADS",
-						"short_name": "MOD02QKM",
-						"title":      "MODIS/Terra Calibrated Radiances",
-						"summary":    "Calibrated radiances in 250m resolution",
+						"id":             "C123-LAADS",
+						"short_name":     "MOD02QKM",
+						"title":          "MODIS/Terra Calibrated Radiances",
+						"summary":        "Calibrated radiances in 250m resolution",
 						"archive_center": "LAADS",
 					},
 				},
@@ -175,13 +175,13 @@ func TestListGranules(t *testing.T) {
 			"feed": map[string]interface{}{
 				"entry": []map[string]interface{}{
 					{
-						"id":                   "G2021957800-LPCLOUD",
-						"title":                "HLS.L30.T10UDV.2024001T185318.v2.0",
-						"producer_granule_id":  "HLS.L30.T10UDV.2024001T185318.v2.0",
-						"data_center":          "LPCLOUD",
-						"granule_size":         189.5,
-						"time_start":           "2024-01-01T18:53:18Z",
-						"time_end":             "2024-01-01T18:53:36Z",
+						"id":                  "G2021957800-LPCLOUD",
+						"title":               "HLS.L30.T10UDV.2024001T185318.v2.0",
+						"producer_granule_id": "HLS.L30.T10UDV.2024001T185318.v2.0",
+						"data_center":         "LPCLOUD",
+						"granule_size":        189.5,
+						"time_start":          "2024-01-01T18:53:18Z",
+						"time_end":            "2024-01-01T18:53:36Z",
 						"links": []map[string]interface{}{
 							{
 								"href": "https://data.lpdaac.earthdatacloud.nasa.gov/lp-prod-protected/HLSL30.020/HLS.L30.T10UDV.2024001T185318.v2.0.B02.tif",
